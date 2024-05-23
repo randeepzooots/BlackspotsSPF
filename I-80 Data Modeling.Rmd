@@ -1,0 +1,288 @@
+---
+title: "I-80 Data Modeling"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+  word_document: default
+---
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+library(MASS)
+library(dplyr)
+library(tidyr)
+library(zipfR)
+library(tibble)
+library(ggplot2)
+library(HelpersMG)
+library(numDeriv)
+library(readxl)
+I_80_Compiled <- read_excel("I-80 Compiled.xlsx", 
+                            sheet = "I-80 Compiled")
+cont_var <- read_excel("I-80 Compiled.xlsx", 
+                            sheet = "Continuous ")
+cat_var <- read_excel("I-80 Compiled.xlsx", 
+                       sheet = "Categorical")
+```
+
+The consolidated data has 4 years' data consolidated for 98 segments. The final dataset has following variables.
+
+Continuous variables:
+
+```{r}
+cont_var
+```
+
+Categorical variables:
+
+```{r}
+cat_var
+```
+
+The variables 'crash_fi' and 'crash_pdo' are the response variables. 'crash_pdo' was dropped from anaylsis and 'crash_fi' used as the response variable for the model.
+
+The variables 'RSOW' and 'RSIW' were dropped before modeling as all the values were identical (only one unique value), hence these variables would not contribute to the model.
+
+```{r}
+X <- I_80_Compiled %>% filter(yr < 3) %>% subset(.,select = -c(segment,yr,RSOW,RSIW,crash_pdo))
+```
+
+Modeling using the MASS package function 'glm.nb'.The function takes the model expression and the data as input.
+
+Defining the model expression:
+
+```{r}
+exp <- crash_fi ~ lanes + lane_width + OSW + ISW + m_width + m_barrier +
+  cz_width + r_barrier + en_ramp_i + ex_ramp_i + w_type_i + en_ramp_d + 
+  ex_ramp_d + w_type_d + aadt
+```
+
+Building model and getting summary of the model:
+
+```{r}
+summary(m1 <- glm.nb(exp,data = X))
+
+```
+
+Modeling the data by defining the Negative Log-Likelihood (NLL) function and finding a solution by minimizing the NLL using the 'optim' function.
+
+The Log-Likelihood function for NB2 model is given by:
+
+$$
+log L(\alpha,\beta)=\sum_{i=1}^{n}\{y_ilog(\alpha)+y_ix_i^{'}\beta-(y_i+\alpha^{-1})log(1+\alpha e^{x_i^{'}\beta})+log\Gamma(y_i+\alpha^{-1})-log(y!)-log\Gamma\alpha^{-1}\}
+$$
+
+Here $\alpha$ is the dispersion parameter, $y_i$ are the observed crashes, $\mu_i=e^{x_i^{'}\beta}$ is the exponential mean.
+
+Response vector:
+
+```{r}
+Y <- X['crash_fi']
+```
+
+Create the design matrix $X$:
+
+```{r}
+dm <- model.matrix(~lanes + lane_width + OSW + ISW + m_width + m_barrier +
+                     cz_width + r_barrier + en_ramp_i + ex_ramp_i + w_type_i + 
+                     en_ramp_d + ex_ramp_d + w_type_d + aadt,data = X)
+```
+
+
+The function 'optim' by default uses 'finite-difference approximation' method to find solution. It takes the function and the initial values of the parameters to be estimated as the input. We will be passing the dispersion parameter ($\alpha$) and the coefficients estimated by the 'glm.nb' function as the initial values of the parameters.
+
+```{r}
+alpha <- m1[24] #dispersion parameter
+beta <- m1$coefficients #regression coefficients
+```
+
+```{r}
+l <- c(alpha,beta)
+# l <- lapply(l,"*",0)
+```
+
+Defining the Negative Log-Likelihood function to be minimized:
+
+```{r}
+nll <- function(l)
+{
+  alpha <- 1/l[1]
+  beta <- l[2:length(l)]
+  -sum(Y*log(alpha)+Y*(dm%*%beta)-(Y+(1/alpha))*log(1+alpha*exp(dm%*%beta))+log(gamma(Y+(1/alpha)))-log(gamma(Y+1))-log(gamma(1/alpha)))
+}
+```
+
+
+Estimating the parameters:
+
+```{r}
+b_est <- optim(l,nll,hessian = T)
+```
+
+
+Model estimates:
+```{r}
+SE = SEfromHessian(b_est$hessian)
+z_score = b_est$par/SE
+p_value = 2*pnorm(-abs(z_score))
+cbind(estimates = b_est$par,SE,z_score,p_value)
+```
+Fitting the model:
+
+```{r}
+y_hat <- exp(dm%*%b_est$par[-1])
+```
+
+Modeling the data by defining Log-Likelihood function censored at $Y\leq4$ and finding a solution using 'optim' function.
+
+The Log-Likelihood function for NB2 model censored at $k$ is given by:
+$$
+L(\alpha,\beta)=\prod_{i=1}^{n}P(y_i)^{\delta_i}P(y_i\leq k)^{(1-\delta_i)}\\
+logL(\alpha,\beta)=\sum_{i=1}^n\{\delta_i[y_ilog(\alpha)+y_ix_i^{'}\beta-(y_i+\alpha^{-1})log(1+\alpha e^{x_i^{'}\beta})+log\Gamma(y_i+\alpha^{-1})-log(y_i!)-log\Gamma\alpha^{-1}]\\+(1-\delta_i)[logB(\frac{\alpha^{-1}}{\alpha^{-1}+e^{x_i'\beta}},\alpha^{-1},k+1)-logB(\alpha^{-1},k+1)]\}
+$$
+
+where,
+$$
+\:\delta_i=
+\begin{cases}
+1 \:, \: y_i>k\\
+0 \:, \: y_i\leq k
+\end{cases}
+$$
+
+Creating blackspot data as per Indian definition. The I-80 data has 4 years' of data, we are using only 3 years of data to satisfy the blackspot definition. Adding number of crashes and AADT for three years:
+```{r}
+X <- I_80_Compiled %>% filter(yr == 0) %>% subset(.,select = -c(aadt,crash_fi))
+
+cal_col <- I_80_Compiled %>% filter(yr < 3) %>% group_by(segment) %>% summarise(aadt = sum(aadt), crash_fi = sum(crash_fi))
+
+X <- merge(X,cal_col,by = 'segment') %>% subset(.,select = -c(segment,yr,RSOW,RSIW,crash_pdo))
+
+dm <- model.matrix(~lanes + lane_width + OSW + ISW + m_width + m_barrier +
+                     cz_width + r_barrier + en_ramp_i + ex_ramp_i + w_type_i + 
+                     en_ramp_d + ex_ramp_d + w_type_d + aadt,data = X)
+# l <- lapply(l,"*",0)
+```
+
+```{r}
+# Z <- I_80_Compiled %>% subset(.,select = -c(aadt,crash_pdo)) %>% spread(.,yr,crash_fi) %>% subset(.,select = c('0','1','2'))
+```
+
+
+Censor at:
+```{r}
+k <- 4
+```
+
+Creating the indicator vector for data censored at $y_i\leq k$:
+
+```{r}
+I <- mutate(X,Indicator = ifelse(crash_fi > k,1,0))$Indicator
+```
+
+Using the previously estimated value of $\alpha$ and $\beta$ by 'glm.nb'to find the solution.
+
+Creating additional vector for beta function values to simplify calculation:
+
+```{r}
+Ibeta1 <- c(Ibeta((1/alpha$theta)/((1/alpha$theta)+exp(dm%*%beta)),(1/alpha$theta),k+1))
+Ibeta2 <- beta((1/alpha$theta),k+1)
+```
+
+Defining the NLL:
+
+```{r}
+nll_c <- function(l)
+{
+  alpha <- 1/unlist(l)[1]
+  beta <- unlist(l)[2:length(l)]
+  -sum(Y*log(alpha)+Y*(dm%*%beta)-(Y+(1/alpha))*log(1+alpha*exp(dm%*%beta))+log(gamma(Y+(1/alpha)))-log(gamma(Y+1))-log(gamma(1/alpha))+(1-I)*(log(Ibeta1)-log(Ibeta2)))
+}
+```
+
+
+Estimating the parameters:
+
+```{r warning=FALSE}
+b_est_c <- optim(l,nll_c)
+```
+
+
+Model Estimates:
+```{r warning=FALSE}
+H <- hessian(nll_c,unlist(l))
+SE = SEfromHessian(H)
+z_score = b_est_c$par/SE
+p_value = 2*pnorm(-abs(z_score))
+cbind(estimates = b_est_c$par,SE,z_score,p_value)
+```
+
+
+Fitting the model:
+
+```{r}
+y_hat_c <- exp(dm%*%b_est_c$par[-1])
+```
+
+Comparison of parameters:
+
+```{r}
+params <- cbind(c(alpha,m1$coefficients),b_est$par,b_est_c$par)
+colnames(params) <- c('glm.nb','MLE','MLE Censored')
+params
+```
+```{r}
+#write.csv(params,'param.csv')
+```
+
+Comparison of fitted vs observed values:
+
+```{r fig.height=4, fig.width=10, dpi=600}
+#knitr::opts_chunk$set(dpi=600)
+Y_hat <- data.frame(cbind(Y,y_hat,y_hat_c))
+colnames(Y_hat) <- c('Observed Crashes', 'MLE', 'MLE Censored')
+M <- Y_hat %>% rownames_to_column(.,var = 'Index')
+M$Index <- as.numeric(M$Index)
+M <- gather(M,'Observed Crashes', 'MLE', 'MLE Censored',key = 'Model',value = 'Crashes')
+ggplot(M,aes(Index,Crashes))+geom_line(aes(color = Model))+theme_bw()
+```
+
+
+```{r}
+est <- b_est$par
+for (i in 1:1000)
+{
+  SX <- sample_n(X,NROW(X),replace = T)
+  Y <- SX['crash_fi']
+  dm <- model.matrix(~lanes + lane_width + OSW + ISW + m_width + m_barrier +
+                     cz_width + r_barrier + en_ramp_i + ex_ramp_i + w_type_i + 
+                     en_ramp_d + ex_ramp_d + w_type_d + aadt,data = SX)
+  b_est <- optim(l,nll)
+  est <- cbind(est,b_est$par)
+}
+```
+
+```{r}
+BSE <- apply(est,1,sd)/sqrt(NCOL(est))
+tvalue <- b_est$par/BSE
+2*pt(-abs(tvalue),271)
+cbind(BSE,SE,c(m1$SE.theta,summary(m1)$coefficients[, "Std. Error"]))
+```
+
+
+```{r}
+gen.cens(family = 'NBI',type = 'left')
+```
+
+```{r}
+NBIlc()
+```
+```{python}
+import pandas as pd
+df2 = pd.read_excel("I-80 Compiled.xlsx")
+```
+
+```{r}
+df2
+```
+
